@@ -9,6 +9,8 @@ dependencies = ["huggingface_hub>=0.30", "pyarrow"]
 [project.optional-dependencies]
 # Kaggle installs unsloth itself (see the notebook); this is for local tests.
 dev = ["pytest", "transformers"]
+# Also run tests/test_train_loop.py (training loop on CPU). Match Kaggle's transformers version.
+train-test = ["torch", "transformers==5.5.0", "datasets", "accelerate", "peft"]
 
 [tool.setuptools]
 packages = ["monkeytrain", "monkeytrain.sources"]

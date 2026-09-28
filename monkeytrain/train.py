@@ -78,6 +78,47 @@ def make_hub_callback(api, repo: str, save_every_s: float, budget_s: float, tota
     return HubCheckpoints()
 
 
+def training_kwargs(cfg: dict, out: Path, bf16: bool) -> dict:
+    """TrainingArguments for this run, for both Transformers 4.x and 5.x."""
+    import dataclasses
+    from transformers import TrainingArguments
+    fields = {f.name for f in dataclasses.fields(TrainingArguments)}
+
+    kw = dict(
+        output_dir=str(out / "ckpt"),
+        per_device_train_batch_size=cfg["batch_size"],
+        gradient_accumulation_steps=cfg["grad_accum"],
+        num_train_epochs=cfg["epochs"],
+        learning_rate=cfg["lr"],
+        lr_scheduler_type="cosine",
+        weight_decay=0.0,
+        optim="adamw_8bit",
+        bf16=bf16, fp16=not bf16,
+        logging_steps=10,
+        save_strategy="steps", save_steps=10**9,  # saving is time-based, see HubCheckpoints
+        save_total_limit=1,
+        seed=cfg["seed"],
+        report_to="none",
+        remove_unused_columns=False,
+        label_names=["labels"],
+        dataloader_num_workers=2,
+    )
+    # Batch sessions of similar length together (less padding). v5 renamed the option.
+    if "train_sampling_strategy" in fields:
+        kw["train_sampling_strategy"] = "group_by_length"
+    else:
+        kw["group_by_length"] = True
+    # v5 dropped warmup_ratio; warmup_steps takes a fraction of training instead.
+    if "warmup_ratio" in fields:
+        kw["warmup_ratio"] = cfg["warmup_ratio"]
+    else:
+        kw["warmup_steps"] = cfg["warmup_ratio"]
+    unknown = set(kw) - fields
+    if unknown:
+        raise SystemExit(f"This Transformers version doesn't accept: {sorted(unknown)}")
+    return kw
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -146,27 +187,7 @@ def main() -> None:
 
     # Real bf16 needs Ampere (sm_80) or newer; T4 is sm_75 and would emulate it slowly.
     bf16 = torch.cuda.get_device_capability(0)[0] >= 8
-    targs = TrainingArguments(
-        output_dir=str(out / "ckpt"),
-        per_device_train_batch_size=cfg["batch_size"],
-        gradient_accumulation_steps=cfg["grad_accum"],
-        num_train_epochs=cfg["epochs"],
-        learning_rate=cfg["lr"],
-        lr_scheduler_type="cosine",
-        warmup_ratio=cfg["warmup_ratio"],
-        weight_decay=0.0,
-        optim="adamw_8bit",
-        bf16=bf16, fp16=not bf16,
-        logging_steps=10,
-        save_strategy="steps", save_steps=10**9,  # saving is time-based, see HubCheckpoints
-        save_total_limit=1,
-        group_by_length=True,  # less padding
-        seed=cfg["seed"],
-        report_to="none",
-        remove_unused_columns=False,
-        label_names=["labels"],
-        dataloader_num_workers=2,
-    )
+    targs = TrainingArguments(**training_kwargs(cfg, out, bf16))
     total_ref: dict = {}
     callback = make_hub_callback(api, r.checkpoints, cfg["save_every_minutes"] * 60,
                                  budget_h * 3600 - (time.time() - started), total_ref)
