@@ -1,0 +1,16 @@
+{
+  "name": "monkey-1.5b",
+  "base_model": "unsloth/Qwen2.5-Coder-1.5B-Instruct",
+  "max_seq_len": 4096,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lr": 0.0002,
+  "epochs": 1,
+  "batch_size": 2,
+  "grad_accum": 8,
+  "warmup_ratio": 0.03,
+  "seed": 3407,
+  "quant": "q4_k_m",
+  "save_every_minutes": 20,
+  "time_budget_hours": 11.0
+}

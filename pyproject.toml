@@ -1,0 +1,17 @@
+[project]
+name = "monkeytrain"
+version = "0.1.0"
+description = "Fine-tuning pipeline for Monkey, the model behind MonkeyPaw"
+requires-python = ">=3.10"
+# Laptop: build the dataset, install into Ollama, evaluate, benchmark.
+dependencies = ["huggingface_hub>=0.30", "pyarrow"]
+
+[project.optional-dependencies]
+# Kaggle installs unsloth itself (see the notebook); this is for local tests.
+dev = ["pytest", "transformers"]
+
+[tool.setuptools]
+packages = ["monkeytrain", "monkeytrain.sources"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
