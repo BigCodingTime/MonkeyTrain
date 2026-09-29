@@ -63,9 +63,11 @@ Try `--total 2000 --no-push` first if you want a quick look; the files land in `
 
 **Resuming:** every run continues from the last checkpoint. If a run hits the time limit it prints *"Run the notebook again to continue"*. Just do *Save & Run All* again. If Kaggle cuts a run off or it crashes, you lose at most ~20 minutes. Kaggle gives ~30 GPU hours a week, and each run can last up to 12 hours.
 
-**Finished:** the last run exports the model automatically (`monkey-0.5b-gguf` on Hugging Face). Then switch `CONFIG` to `configs/monkey-1.5b.json` and repeat.
+**Finished:** the log prints `[check] P(<tool_call>) ...`, which should be ≥ 0.5, and the last run exports the model automatically (`monkey-0.5b-gguf` on Hugging Face). Then switch `CONFIG` to `configs/monkey-1.5b.json` and repeat.
 
-To start a model over from scratch: `python -m monkeytrain.train --config ... --restart` (or delete its `-train` repo on Hugging Face).
+To train a new version (e.g. after changing the data or training code), raise `"version"` in the config. The new run gets its own checkpoint repo and GGUF file, and the old ones are left alone.
+
+To restart the current version from scratch: `python -m monkeytrain.train --config ... --restart` (or delete its `-train` repo on Hugging Face).
 
 ---
 

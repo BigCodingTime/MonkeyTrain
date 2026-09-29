@@ -21,7 +21,9 @@ import shutil
 import time
 from pathlib import Path
 
+from .check import tool_call_probability
 from .encode import encode_session
+from .render import TRAINABLE_TOKENS
 from .hub import load_config, repos, require_token, username
 
 STATUS = "status.json"
@@ -76,6 +78,14 @@ def make_hub_callback(api, repo: str, save_every_s: float, budget_s: float, tota
             print(f"[hub] uploaded checkpoint at step {state.global_step} ({time.time() - t0:.0f}s)", flush=True)
 
     return HubCheckpoints()
+
+
+def trainable_token_ids(tokenizer) -> list[int]:
+    """Embedding rows to train directly (see render.TRAINABLE_TOKENS)."""
+    ids = tokenizer.convert_tokens_to_ids(TRAINABLE_TOKENS)
+    if any(i is None or i == tokenizer.unk_token_id for i in ids):
+        raise SystemExit(f"Tokenizer is missing one of {TRAINABLE_TOKENS}")
+    return ids
 
 
 def training_kwargs(cfg: dict, out: Path, bf16: bool) -> dict:
@@ -138,7 +148,7 @@ def main() -> None:
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     token = require_token()
     api = HfApi(token=token)
-    r = repos(username(token), cfg["name"])
+    r = repos(username(token), cfg)
     api.create_repo(r.checkpoints, private=True, exist_ok=True)
 
     status = {} if args.restart else read_status(api, r.checkpoints)
@@ -168,7 +178,10 @@ def main() -> None:
     model = FastLanguageModel.get_peft_model(
         model, r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=0, bias="none",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        use_gradient_checkpointing="unsloth", random_state=cfg["seed"])
+        use_gradient_checkpointing="unsloth", random_state=cfg["seed"],
+        # LoRA can't teach a token the base model never produces; train those embedding rows too.
+        # Qwen ties input and output embeddings, so this also updates the output row.
+        trainable_token_indices={"embed_tokens": trainable_token_ids(tokenizer)})
     tokenizer.padding_side = "right"
 
     # ---- data ----
@@ -205,6 +218,12 @@ def main() -> None:
     if callback.out_of_time:
         print("\n[train] time budget reached — checkpoint uploaded. Run the notebook again to continue.")
         return
+
+    tasks_path = hf_hub_download(r.data, "eval_tasks.jsonl", repo_type="dataset", token=token)
+    tasks = [json.loads(line) for line in open(tasks_path, encoding="utf-8")]
+    model.eval()
+    p = tool_call_probability(model, tokenizer, tasks)
+    print(f"[check] P(<tool_call>) as first reply token on held-out tasks: {p:.2f} (want >= 0.5)")
 
     final = out / FINAL
     shutil.rmtree(final, ignore_errors=True)

@@ -20,8 +20,30 @@ def _post(path: str, body: dict, timeout: float = 900) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:  # Ollama answered, but with an error
+        detail = e.read().decode(errors="replace")
+        if e.code == 404:
+            raise SystemExit(f"Ollama doesn't have model '{body.get('model')}'. Check `ollama list`; for a "
+                             f"Monkey model run `python -m monkeytrain.install --config configs/<model>.json` "
+                             f"first. ({detail})") from e
+        raise SystemExit(f"Ollama returned HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
-        raise SystemExit(f"Can't reach Ollama at {HOST} ({e}). Is Ollama installed and running?") from e
+        raise SystemExit(f"Can't reach Ollama at {HOST} ({e.reason}). Is Ollama installed and running?") from e
+
+
+def find_ollama() -> str | None:
+    """The ollama executable: PATH first, then the default Windows install folder
+    (a terminal opened before installing Ollama doesn't see its PATH entry)."""
+    import shutil
+    found = shutil.which("ollama")
+    if found:
+        return found
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        exe = os.path.join(local, "Programs", "Ollama", "ollama.exe")
+        if os.path.exists(exe):
+            return exe
+    return None
 
 
 def options(threads: int | None, ctx: int | None, **extra) -> dict:

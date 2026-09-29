@@ -11,12 +11,11 @@ override them per request, so you normally leave --threads unset.
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 from pathlib import Path
 
 from .hub import load_config, repos, require_token, username
-from .ollama import modelfile
+from .ollama import find_ollama, modelfile
 
 MODELS_DIR = Path.home() / ".monkeypaw" / "models"
 
@@ -28,14 +27,15 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, default=8192, help="default context window in tokens")
     args = ap.parse_args()
 
-    if shutil.which("ollama") is None:
+    ollama_exe = find_ollama()
+    if ollama_exe is None:
         raise SystemExit("Ollama isn't installed. Get it from https://ollama.com/download and run this again.")
 
     cfg = load_config(args.config)
     from huggingface_hub import hf_hub_download
     token = require_token()
-    r = repos(username(token), cfg["name"])
-    gguf_name = f"{cfg['name']}-{cfg['quant'].upper()}.gguf"
+    r = repos(username(token), cfg)
+    gguf_name = r.gguf_file
     dest = MODELS_DIR / cfg["name"]
     dest.mkdir(parents=True, exist_ok=True)
     print(f"[install] downloading {gguf_name} from {r.gguf} ...")
@@ -43,7 +43,7 @@ def main() -> None:
 
     mf = dest / "Modelfile"
     mf.write_text(modelfile(str(gguf.resolve()), ctx=args.ctx, threads=args.threads), encoding="utf-8")
-    subprocess.run(["ollama", "create", cfg["name"], "-f", str(mf)], check=True)
+    subprocess.run([ollama_exe, "create", cfg["name"], "-f", str(mf)], check=True)
     print(f"\n[install] done. Try it:  ollama run {cfg['name']}")
     print(f"[install] measure speed: python -m monkeytrain.bench --model {cfg['name']}")
 

@@ -68,6 +68,16 @@ A callback saves by time, uploads the checkpoint folder (adapter, optimizer, sch
 
 Defaults: 1 epoch over ~24k sessions, lr 2e-4 cosine, 3% warmup, effective batch 16, 8-bit AdamW, fp16 on T4, `group_by_length` to limit padding.
 
+## Lesson from v1: tool-call tokens must be trained directly
+
+The first 0.5B run trained cleanly (loss 1.19 → 0.6) but produced garbage in Ollama. Qwen2.5-Coder has `<tool_call>` / `</tool_call>` as single tokens but was never trained to produce them: the base model gives the correct `<tool_call>` probability ~1e-10 (loss ≈ 23). LoRA adapts the transformer layers but can't change a token's embedding, and Qwen ties input and output embeddings, so after training it still reached only ~6e-5. It learned everything around the markers (average loss 0.13 elsewhere) but couldn't open a tool call, so free generation derailed and never reached `<|im_end|>`.
+
+Fix (v2):
+- `train.py` passes `trainable_token_indices={"embed_tokens": [<tool_call>, </tool_call>]}` to the LoRA config. That trains only those two embedding rows, which with tied weights also updates the output rows.
+- `export.py` merges with PEFT (which applies the trained rows) instead of Unsloth's merge. It then measures P(`<tool_call>` as the first reply token) on held-out tasks and refuses to export below 0.5. The v1 model scores 0.0001.
+- `train.py` prints the same check at the end of training.
+- Each training run has a `version` in its config and its own `-v<N>-train` checkpoint repo, so a new run never resumes from, or skips because of, an old one.
+
 ## Evaluation
 
 `evaluate.py` runs the model through Ollama (the real quantized model and prompt path) as an agent over held-out commit tasks in the sandbox, for up to 8 steps. It reports: finished, changed the right file, exact match with the commit, touched other files, rewrote a whole existing file, tool/format errors per task, and speed. Compare `qwen2.5-coder:*` against `monkey-*` to see whether fine-tuning helped. Exact match is strict (a commit message rarely fully specifies the change), so watch the trend, not the absolute number.

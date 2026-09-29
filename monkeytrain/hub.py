@@ -42,15 +42,28 @@ def username(token: str) -> str:
 
 @dataclass
 class Repos:
-    data: str        # dataset: train.jsonl, eval.jsonl
+    data: str         # dataset: train.jsonl, eval_tasks.jsonl
     checkpoints: str  # model: last-checkpoint/, final/, status.json
-    gguf: str        # model: the file Ollama runs
+    gguf: str         # model: the files Ollama runs
+    gguf_file: str    # this version's file inside the gguf repo
 
 
-def repos(user: str, model_name: str) -> Repos:
-    return Repos(data=f"{user}/monkey-data",
-                 checkpoints=f"{user}/{model_name}-train",
-                 gguf=f"{user}/{model_name}-gguf")
+def data_repo(user: str) -> str:
+    return f"{user}/monkey-data"
+
+
+def repos(user: str, cfg: dict) -> Repos:
+    """
+    Repo names for a model config. Each training version ("version" in the
+    config) gets its own checkpoint repo, so a new run never resumes or skips
+    because of an older one. Version 1 keeps its original, unversioned names.
+    """
+    name, version = cfg["name"], int(cfg.get("version", 1))
+    tag = name if version == 1 else f"{name}-v{version}"
+    return Repos(data=data_repo(user),
+                 checkpoints=f"{user}/{tag}-train",
+                 gguf=f"{user}/{name}-gguf",
+                 gguf_file=f"{tag}-{cfg['quant'].upper()}.gguf")
 
 
 def load_config(path: str | Path) -> dict:

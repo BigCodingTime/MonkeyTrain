@@ -102,9 +102,9 @@ def load_tasks(path: str | None) -> list[dict]:
         p = Path(path)
     else:
         from huggingface_hub import hf_hub_download
-        from .hub import repos, require_token, username
+        from .hub import data_repo, require_token, username
         token = require_token()
-        p = Path(hf_hub_download(repos(username(token), "unused").data, "eval_tasks.jsonl",
+        p = Path(hf_hub_download(data_repo(username(token)), "eval_tasks.jsonl",
                                  repo_type="dataset", token=token))
     return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -120,7 +120,8 @@ def main() -> None:
     args = ap.parse_args()
 
     tasks = load_tasks(args.tasks)[: args.n]
-    opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1)
+    # num_predict caps a reply, so a model that never stops can't hang the run
+    opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1, num_predict=1024)
     results = []
     for i, task in enumerate(tasks, 1):
         r = run_task(task, args.model, opts)

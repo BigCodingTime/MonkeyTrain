@@ -19,6 +19,11 @@ import re
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 
+# Qwen2.5-Coder has these as single tokens but was never trained to produce
+# them, and LoRA can't change a token's embedding. Training updates their
+# embedding rows directly (see train.py).
+TRAINABLE_TOKENS = ["<tool_call>", "</tool_call>"]
+
 TOOLS_PREAMBLE = (
     "\n\n# Tools\n\n"
     "You may call one or more functions to assist with the user query.\n\n"

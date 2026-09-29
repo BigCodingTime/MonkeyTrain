@@ -18,7 +18,9 @@ pytest.importorskip("datasets")
 transformers = pytest.importorskip("transformers")
 
 from monkeytrain.encode import encode_session  # noqa: E402
-from monkeytrain.train import LAST, make_hub_callback, training_kwargs  # noqa: E402
+from monkeytrain.check import tool_call_probability  # noqa: E402
+from monkeytrain.export import merge_adapter  # noqa: E402
+from monkeytrain.train import LAST, make_hub_callback, trainable_token_ids, training_kwargs  # noqa: E402
 
 CFG = {"batch_size": 2, "grad_accum": 2, "epochs": 1, "lr": 1e-3, "warmup_ratio": 0.03, "seed": 1}
 
@@ -58,22 +60,29 @@ def tok():
     return t
 
 
-def tiny_model(tok):
+def tiny_base(tok):
+    # Tied input/output embeddings, like Qwen2.5-Coder 0.5B/1.5B.
     torch.manual_seed(0)
     cfg = transformers.Qwen2Config(vocab_size=len(tok), hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                                   num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=4096)
-    model = transformers.Qwen2ForCausalLM(cfg)
-    lora = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
-    return peft.get_peft_model(model, lora)
+                                   num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=4096,
+                                   tie_word_embeddings=True)
+    return transformers.Qwen2ForCausalLM(cfg)
 
 
-def make_trainer(tok, out: Path, hub: FakeHub, save_every_s: float, budget_s: float):
+def tiny_model(tok):
+    # Same LoRA + trainable token rows as train.py.
+    lora = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM",
+                           trainable_token_indices={"embed_tokens": trainable_token_ids(tok)})
+    return peft.get_peft_model(tiny_base(tok), lora)
+
+
+def make_trainer(tok, out: Path, hub: FakeHub, save_every_s: float, budget_s: float, cfg=CFG, n=40):
     from datasets import Dataset
-    rows = [encode_session(SESSION, tok, 4096) for _ in range(40)]
+    rows = [encode_session(SESSION, tok, 4096) for _ in range(n)]
     assert all(rows)
-    kw = training_kwargs(CFG, out, bf16=False)
+    kw = training_kwargs(cfg, out, bf16=False)
     kw.update(fp16=False, optim="adamw_torch", dataloader_num_workers=0, use_cpu=True)  # CPU stand-ins
-    callback = make_hub_callback(hub, "user/repo", save_every_s, budget_s, {"n": 10})
+    callback = make_hub_callback(hub, "user/repo", save_every_s, budget_s, {"n": n // 4})
     trainer = transformers.Trainer(
         model=tiny_model(tok), args=transformers.TrainingArguments(**kw), train_dataset=Dataset.from_list(rows),
         data_collator=transformers.DataCollatorForSeq2Seq(tok, padding=True, pad_to_multiple_of=8, label_pad_token_id=-100),
@@ -102,3 +111,30 @@ def test_stop_at_budget_then_resume(tok, tmp_path):
     trainer.train(resume_from_checkpoint=str(hub.root / LAST))
     assert not cb.out_of_time
     assert trainer.state.global_step == 10
+
+
+TASKS = [{"system": "SYS", "request": "find foo"}]
+
+
+def test_tool_call_token_is_learned_and_survives_merge(tok, tmp_path):
+    """The v1 bug: LoRA alone never learned <tool_call>. With trainable token rows,
+    training teaches it, and saving + PEFT merge (export's path) keep it."""
+    base_dir = tmp_path / "base"
+    tiny_base(tok).save_pretrained(base_dir)
+    before = tool_call_probability(tiny_base(tok), tok, TASKS)
+
+    hub = FakeHub(tmp_path / "hub")
+    hub.root.mkdir()
+    fast = {**CFG, "lr": 5e-2, "batch_size": 4, "grad_accum": 1, "epochs": 1}
+    trainer, _ = make_trainer(tok, tmp_path / "run", hub, 10**6, 10**6, cfg=fast, n=120)
+    trainer.train()
+    adapter = tmp_path / "adapter"
+    trainer.model.save_pretrained(adapter)
+    tok.save_pretrained(adapter)
+    trained = tool_call_probability(trainer.model, tok, TASKS)
+
+    merged, mtok = merge_adapter(str(base_dir), adapter)
+    after_merge = tool_call_probability(merged, mtok, TASKS)
+    assert before < 0.01
+    assert trained > 0.3  # tiny random model, 30 steps: ~0.46 observed
+    assert after_merge == pytest.approx(trained, abs=0.02)

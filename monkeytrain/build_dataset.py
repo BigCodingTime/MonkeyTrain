@@ -18,7 +18,7 @@ import random
 from collections import Counter, deque
 from pathlib import Path
 
-from .hub import get_token, repos, username
+from .hub import data_repo, get_token, username
 from .sources import commitpack, selfoss, xlam
 
 DEFAULT_MIX = {"commitpack": 0.75, "selfoss": 0.15, "xlam": 0.10}
@@ -132,7 +132,7 @@ def main() -> None:
     if not token:
         raise SystemExit("Not logged in to Hugging Face; run `hf auth login` or use --no-push.")
     from huggingface_hub import HfApi
-    repo = repos(username(token), "unused").data
+    repo = data_repo(username(token))
     api = HfApi(token=token)
     api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
     api.upload_folder(repo_id=repo, repo_type="dataset", folder_path=str(out),
