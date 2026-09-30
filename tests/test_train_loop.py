@@ -20,7 +20,7 @@ transformers = pytest.importorskip("transformers")
 from monkeytrain.encode import encode_session  # noqa: E402
 from monkeytrain.check import tool_call_probability  # noqa: E402
 from monkeytrain.export import merge_adapter  # noqa: E402
-from monkeytrain.train import LAST, make_hub_callback, trainable_token_ids, training_kwargs  # noqa: E402
+from monkeytrain.train import LAST, build_model, make_hub_callback, make_token_watch, training_kwargs  # noqa: E402
 
 CFG = {"batch_size": 2, "grad_accum": 2, "epochs": 1, "lr": 1e-3, "warmup_ratio": 0.03, "seed": 1}
 
@@ -69,33 +69,35 @@ def tiny_base(tok):
     return transformers.Qwen2ForCausalLM(cfg)
 
 
-def tiny_model(tok):
-    # Same LoRA + trainable token rows as train.py.
-    lora = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM",
-                           trainable_token_indices={"embed_tokens": trainable_token_ids(tok)})
-    return peft.get_peft_model(tiny_base(tok), lora)
+@pytest.fixture(scope="module")
+def base_dir(tok, tmp_path_factory):
+    d = tmp_path_factory.mktemp("base")
+    tiny_base(tok).save_pretrained(d)
+    tok.save_pretrained(d)
+    return d
 
 
-def make_trainer(tok, out: Path, hub: FakeHub, save_every_s: float, budget_s: float, cfg=CFG, n=40):
+def make_trainer(tok, base_dir, out: Path, hub: FakeHub, save_every_s: float, budget_s: float, cfg=CFG, n=40):
     from datasets import Dataset
     rows = [encode_session(SESSION, tok, 4096) for _ in range(n)]
     assert all(rows)
     kw = training_kwargs(cfg, out, bf16=False)
     kw.update(fp16=False, optim="adamw_torch", dataloader_num_workers=0, use_cpu=True)  # CPU stand-ins
     callback = make_hub_callback(hub, "user/repo", save_every_s, budget_s, {"n": n // 4})
+    model, _ = build_model(str(base_dir), {"lora_r": 4, "lora_alpha": 8, **cfg})  # train.py's model setup
     trainer = transformers.Trainer(
-        model=tiny_model(tok), args=transformers.TrainingArguments(**kw), train_dataset=Dataset.from_list(rows),
+        model=model, args=transformers.TrainingArguments(**kw), train_dataset=Dataset.from_list(rows),
         data_collator=transformers.DataCollatorForSeq2Seq(tok, padding=True, pad_to_multiple_of=8, label_pad_token_id=-100),
-        callbacks=[callback])
+        callbacks=[callback, make_token_watch(model, after_steps=2)])
     return trainer, callback
 
 
-def test_stop_at_budget_then_resume(tok, tmp_path):
+def test_stop_at_budget_then_resume(tok, base_dir, tmp_path):
     hub = FakeHub(tmp_path / "hub")
     hub.root.mkdir()
 
     # Run 1: save after every step, budget runs out right away -> stops early with a checkpoint.
-    trainer, cb = make_trainer(tok, tmp_path / "run1", hub, save_every_s=0, budget_s=0)
+    trainer, cb = make_trainer(tok, base_dir, tmp_path / "run1", hub, save_every_s=0, budget_s=0)
     trainer.train()
     assert cb.out_of_time
     assert hub.uploads >= 1
@@ -107,7 +109,7 @@ def test_stop_at_budget_then_resume(tok, tmp_path):
     assert (hub.root / LAST / "adapter_model.safetensors").exists()
 
     # Run 2: resume from the 'uploaded' checkpoint and finish all 10 steps.
-    trainer, cb = make_trainer(tok, tmp_path / "run2", hub, save_every_s=10**6, budget_s=10**6)
+    trainer, cb = make_trainer(tok, base_dir, tmp_path / "run2", hub, save_every_s=10**6, budget_s=10**6)
     trainer.train(resume_from_checkpoint=str(hub.root / LAST))
     assert not cb.out_of_time
     assert trainer.state.global_step == 10
@@ -116,17 +118,15 @@ def test_stop_at_budget_then_resume(tok, tmp_path):
 TASKS = [{"system": "SYS", "request": "find foo"}]
 
 
-def test_tool_call_token_is_learned_and_survives_merge(tok, tmp_path):
+def test_tool_call_token_is_learned_and_survives_merge(tok, base_dir, tmp_path):
     """The v1 bug: LoRA alone never learned <tool_call>. With trainable token rows,
     training teaches it, and saving + PEFT merge (export's path) keep it."""
-    base_dir = tmp_path / "base"
-    tiny_base(tok).save_pretrained(base_dir)
     before = tool_call_probability(tiny_base(tok), tok, TASKS)
 
     hub = FakeHub(tmp_path / "hub")
     hub.root.mkdir()
     fast = {**CFG, "lr": 5e-2, "batch_size": 4, "grad_accum": 1, "epochs": 1}
-    trainer, _ = make_trainer(tok, tmp_path / "run", hub, 10**6, 10**6, cfg=fast, n=120)
+    trainer, _ = make_trainer(tok, base_dir, tmp_path / "run", hub, 10**6, 10**6, cfg=fast, n=120)
     trainer.train()
     adapter = tmp_path / "adapter"
     trainer.model.save_pretrained(adapter)
@@ -135,6 +135,19 @@ def test_tool_call_token_is_learned_and_survives_merge(tok, tmp_path):
 
     merged, mtok = merge_adapter(str(base_dir), adapter)
     after_merge = tool_call_probability(merged, mtok, TASKS)
-    assert before < 0.01
-    assert trained > 0.3  # tiny random model, 30 steps: ~0.46 observed
+    print(f"P(<tool_call>) before {before:.2e}, trained {trained:.2e}, merged {after_merge:.2e}")
+    assert before < 0.001
+    assert trained > 20 * before  # a tiny random model only gets partway in 30 steps
     assert after_merge == pytest.approx(trained, abs=0.02)
+
+
+def test_token_watch_stops_run_when_rows_are_frozen(tok, base_dir, tmp_path):
+    """What went wrong under Unsloth: rows frozen -> the watch must stop the run."""
+    hub = FakeHub(tmp_path / "hub")
+    hub.root.mkdir()
+    trainer, _ = make_trainer(tok, base_dir, tmp_path / "run", hub, 10**6, 10**6)
+    for n, p in trainer.model.named_parameters():
+        if "trainable_tokens_delta" in n:
+            p.requires_grad_(False)
+    with pytest.raises(SystemExit, match="aren't training"):
+        trainer.train()

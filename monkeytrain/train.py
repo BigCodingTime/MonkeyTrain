@@ -1,5 +1,10 @@
 """
-Fine-tune Qwen2.5-Coder into Monkey with LoRA. Runs on a Kaggle T4 GPU.
+Fine-tune Qwen2.5-Coder into Monkey with LoRA plus two trained token rows.
+Runs on a Kaggle T4 GPU with plain Transformers + PEFT.
+
+Not Unsloth: its fast embedding/output code bypasses PEFT's trainable-token
+wrapper, so the <tool_call> rows never trained (v2 run: bit-identical to the
+base after 1,264 steps). TokenRowsWatch stops a run early if that ever recurs.
 
   python -m monkeytrain.train --config configs/monkey-1.5b.json
 
@@ -88,6 +93,60 @@ def trainable_token_ids(tokenizer) -> list[int]:
     return ids
 
 
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def build_model(base_model: str, cfg: dict, token: str | None = None, dtype=None):
+    """Base model + LoRA on every linear layer + trainable <tool_call> rows."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, token=token)
+    tokenizer.padding_side = "right"
+    model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, token=token)
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    lora = LoraConfig(
+        r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=0.0, bias="none",
+        target_modules=TARGET_MODULES, task_type="CAUSAL_LM",
+        # LoRA can't teach a token the base model never produces; train those embedding rows too.
+        # Qwen ties input and output embeddings, so this also changes the output rows.
+        trainable_token_indices={"embed_tokens": trainable_token_ids(tokenizer)})
+    model = get_peft_model(model, lora)
+    # fp16 mixed precision needs fp32 trainable weights (the frozen base stays 16-bit).
+    for param in model.parameters():
+        if param.requires_grad and param.dtype != torch.float32:
+            param.data = param.data.float()
+    return model, tokenizer
+
+
+def make_token_watch(model, after_steps: int = 50):
+    """Stop the run if the <tool_call> rows haven't changed after `after_steps` steps."""
+    from transformers import TrainerCallback
+
+    deltas = [(n, p) for n, p in model.named_parameters() if "trainable_tokens_delta" in n]
+    if not deltas:
+        raise SystemExit("No trainable token rows in the model; the <tool_call> fix isn't active.")
+    start = {n: p.detach().clone() for n, p in deltas}
+
+    class TokenRowsWatch(TrainerCallback):
+        checked = False
+
+        def on_step_end(self, args, state, control, **kw):
+            if self.checked or state.global_step < after_steps:
+                return control
+            self.checked = True
+            moved = max((p.detach() - start[n].to(p.device)).abs().max().item() for n, p in deltas)
+            print(f"[check] <tool_call> rows changed by {moved:.2e} after {state.global_step} steps", flush=True)
+            if moved == 0:
+                raise SystemExit("[check] The <tool_call> token rows aren't training. Stopping so no GPU time "
+                                 "is wasted; send this log to get it fixed.")
+            return control
+
+    return TokenRowsWatch()
+
+
 def training_kwargs(cfg: dict, out: Path, bf16: bool) -> dict:
     """TrainingArguments for this run, for both Transformers 4.x and 5.x."""
     import dataclasses
@@ -102,7 +161,7 @@ def training_kwargs(cfg: dict, out: Path, bf16: bool) -> dict:
         learning_rate=cfg["lr"],
         lr_scheduler_type="cosine",
         weight_decay=0.0,
-        optim="adamw_8bit",
+        optim="adamw_torch",
         bf16=bf16, fp16=not bf16,
         logging_steps=10,
         save_strategy="steps", save_steps=10**9,  # saving is time-based, see HubCheckpoints
@@ -167,22 +226,17 @@ def main() -> None:
     else:
         print("[train] no checkpoint found — starting fresh")
 
-    # ---- model (Unsloth: 4-bit base + LoRA, ~2x faster on T4) ----
-    from unsloth import FastLanguageModel  # must be imported before transformers
+    # ---- model: 16-bit base + LoRA + trainable <tool_call> rows ----
     import torch
     from datasets import Dataset
     from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        cfg["base_model"], max_seq_length=cfg["max_seq_len"], load_in_4bit=True, dtype=None, token=token)
-    model = FastLanguageModel.get_peft_model(
-        model, r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=0, bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        use_gradient_checkpointing="unsloth", random_state=cfg["seed"],
-        # LoRA can't teach a token the base model never produces; train those embedding rows too.
-        # Qwen ties input and output embeddings, so this also updates the output row.
-        trainable_token_indices={"embed_tokens": trainable_token_ids(tokenizer)})
-    tokenizer.padding_side = "right"
+    # Real bf16 needs Ampere (sm_80) or newer; T4 is sm_75 and would emulate it slowly.
+    bf16 = torch.cuda.get_device_capability(0)[0] >= 8
+    torch.manual_seed(cfg["seed"])
+    model, tokenizer = build_model(cfg["base_model"], cfg, token, torch.bfloat16 if bf16 else torch.float16)
+    model.to("cuda")
+    model.print_trainable_parameters()
 
     # ---- data ----
     train_path = hf_hub_download(r.data, "train.jsonl", repo_type="dataset", token=token)
@@ -198,8 +252,6 @@ def main() -> None:
     print(f"[data] {len(rows)} sessions ({skipped} skipped as too long), {n_tokens / 1e6:.1f}M tokens")
     dataset = Dataset.from_list(rows)
 
-    # Real bf16 needs Ampere (sm_80) or newer; T4 is sm_75 and would emulate it slowly.
-    bf16 = torch.cuda.get_device_capability(0)[0] >= 8
     targs = TrainingArguments(**training_kwargs(cfg, out, bf16))
     total_ref: dict = {}
     callback = make_hub_callback(api, r.checkpoints, cfg["save_every_minutes"] * 60,
@@ -207,7 +259,7 @@ def main() -> None:
     trainer = Trainer(
         model=model, args=targs, train_dataset=dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True, pad_to_multiple_of=8, label_pad_token_id=-100),
-        callbacks=[callback],
+        callbacks=[callback, make_token_watch(model)],
     )
     total_ref["n"] = -(-len(dataset) // (cfg["batch_size"] * cfg["grad_accum"])) * cfg["epochs"]
     print(f"[train] {total_ref['n']} optimizer steps; saving every {cfg['save_every_minutes']} min; "
@@ -239,5 +291,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")  # Kaggle gives 2x T4; Unsloth trains on one
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")  # Kaggle gives 2x T4; train on one
     main()
