@@ -14,6 +14,10 @@ if not HOST.startswith("http"):
     HOST = "http://" + HOST
 
 
+class OllamaError(RuntimeError):
+    """Ollama answered with an error for this request (e.g. it aborted a looping reply)."""
+
+
 def _post(path: str, body: dict, timeout: float = 900) -> dict:
     req = urllib.request.Request(HOST + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -26,7 +30,7 @@ def _post(path: str, body: dict, timeout: float = 900) -> dict:
             raise SystemExit(f"Ollama doesn't have model '{body.get('model')}'. Check `ollama list`; for a "
                              f"Monkey model run `python -m monkeytrain.install --config configs/<model>.json` "
                              f"first. ({detail})") from e
-        raise SystemExit(f"Ollama returned HTTP {e.code}: {detail}") from e
+        raise OllamaError(f"Ollama returned HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise SystemExit(f"Can't reach Ollama at {HOST} ({e.reason}). Is Ollama installed and running?") from e
 
@@ -74,6 +78,11 @@ def modelfile(gguf_path: str, ctx: int = 8192, threads: int | None = None) -> st
         "PARAMETER stop <|im_end|>",
         "PARAMETER stop <|endoftext|>",
         "PARAMETER temperature 0.2",
+        # Ollama otherwise applies repeat_penalty 1.05, which fights edit_file: old_string
+        # must repeat text from the file exactly.
+        "PARAMETER repeat_penalty 1.0",
+        "PARAMETER top_p 0.95",
+        "PARAMETER top_k 40",
         f"PARAMETER num_ctx {ctx}",
     ]
     if threads:

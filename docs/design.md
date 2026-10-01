@@ -88,6 +88,9 @@ Fix (v2):
 2. System prompt: `tools.SYSTEM_TEMPLATE`. MonkeyPaw's core spec says about 700 tokens with MONKEEPAW.md. Keep the rules section identical and append the rest.
 3. Tool result wording: `sandbox.py` (numbered `read_file` lines as `%6d\t`, `Edited <path>: replaced 1 occurrence.`, `path:line:text` for grep, error texts).
 4. Model tiers in `system/models.ts`: `light → monkey-0.5b`, `balanced`/`max → monkey-1.5b` once they beat the base models.
+5. **Prompt building: MonkeyPaw renders Monkey's prompt itself and calls Ollama's `/api/generate` with `raw: true`**, then parses `<tool_call>` blocks itself. That means porting `render.render()` and `render.parse_tool_calls()` to TypeScript (about 80 lines) as a `MonkeyRawProvider`. Use `/api/chat` only for third-party models such as stock Qwen.
+   Why: with `/api/chat`, Ollama fills in the Modelfile template using its own JSON formatting for tool definitions and past tool calls, and that formatting changes between Ollama versions. Under Ollama 0.35 the same conversation came out 6 tokens different from training (282 vs 288), and Monkey 0.5B then wrote `edit_file` calls without `old_string` (13 of 17 tool errors in the eval). Given the training-format prompt via raw mode, the same model wrote the call correctly. Raw mode also keeps Ollama's prompt cache working, because the prefix is byte-stable.
+   Send `repeat_penalty: 1.0` (the Modelfile sets it too). Ollama's default of 1.05 penalises the exact copying that `old_string` needs.
 
 If any of these change in MonkeyPaw, update them here and retrain. The Modelfile template comes with the model.
 

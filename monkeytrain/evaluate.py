@@ -18,14 +18,31 @@ import time
 from pathlib import Path
 
 from . import ollama
-from .render import parse_tool_calls
+from .render import parse_tool_calls, render
 from .sandbox import Workspace
 from .tools import TOOL_NAMES, TOOLS
 
 MAX_STEPS = 8
 
 
-def model_turn(model: str, messages: list[dict], opts: dict) -> tuple[str, list[dict], list[str], dict]:
+def model_turn(model: str, messages: list[dict], opts: dict, mode: str = "raw",
+               ) -> tuple[str, list[dict], list[str], dict]:
+    """
+    One model reply. "raw" builds the prompt with render() -- byte-identical to
+    training -- and parses tool calls itself; Ollama only runs the model. "chat"
+    lets Ollama build the prompt from the Modelfile template, which drifts from
+    training as Ollama changes (0.35 renders tool JSON differently; Monkey then
+    dropped old_string from edit_file calls).
+    """
+    if mode == "raw":
+        prompt, _ = render(messages, TOOLS, add_generation_prompt=True)
+        try:
+            resp = ollama.generate(model, prompt, opts)
+        except ollama.OllamaError as e:  # e.g. Ollama aborted a reply stuck in a loop
+            return "", [], [str(e)], {}
+        content, calls, errors = parse_tool_calls(resp.get("response", ""))
+        return content, calls, errors, resp
+
     resp = ollama.chat(model, messages, TOOLS, opts)
     msg = resp.get("message", {})
     content = msg.get("content") or ""
@@ -37,7 +54,7 @@ def model_turn(model: str, messages: list[dict], opts: dict) -> tuple[str, list[
     return content, calls, errors, resp
 
 
-def run_task(task: dict, model: str, opts: dict) -> dict:
+def run_task(task: dict, model: str, opts: dict, mode: str = "raw") -> dict:
     ws = Workspace(task["files"])
     messages = [{"role": "system", "content": task["system"]}, {"role": "user", "content": task["request"]}]
     r = {"steps": 0, "calls": 0, "format_errors": 0, "unknown_tools": 0, "tool_errors": 0,
@@ -45,7 +62,7 @@ def run_task(task: dict, model: str, opts: dict) -> dict:
     t0 = time.time()
     for _ in range(MAX_STEPS):
         r["steps"] += 1
-        content, calls, errors, resp = model_turn(model, messages, opts)
+        content, calls, errors, resp = model_turn(model, messages, opts, mode)
         r["format_errors"] += len(errors)
         r["gen_tokens"] += resp.get("eval_count", 0)
         r["gen_seconds"] += resp.get("eval_duration", 0) / 1e9
@@ -117,6 +134,8 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=None)
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--out", default="eval_results")
+    ap.add_argument("--mode", choices=["raw", "chat"], default="raw",
+                    help="raw: our prompt format (as trained); chat: Ollama's template")
     args = ap.parse_args()
 
     tasks = load_tasks(args.tasks)[: args.n]
@@ -124,7 +143,7 @@ def main() -> None:
     opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1, num_predict=1024)
     results = []
     for i, task in enumerate(tasks, 1):
-        r = run_task(task, args.model, opts)
+        r = run_task(task, args.model, opts, args.mode)
         results.append(r)
         mark = "exact" if r["exact_match"] else ("changed" if r["changed_target"] else "no change")
         print(f"[{i}/{len(tasks)}] {task['target_path']}: {mark}, {r['steps']} steps, "
@@ -134,8 +153,8 @@ def main() -> None:
     print("\n" + "\n".join(f"{k:>24}: {v:.1f}" if isinstance(v, float) else f"{k:>24}: {v}" for k, v in summary.items()))
     out = Path(args.out)
     out.mkdir(exist_ok=True)
-    fname = out / f"{args.model.replace(':', '_').replace('/', '_')}.json"
-    fname.write_text(json.dumps({"model": args.model, "summary": summary, "tasks": results}, indent=2), encoding="utf-8")
+    fname = out / f"{args.model.replace(':', '_').replace('/', '_')}-{args.mode}.json"
+    fname.write_text(json.dumps({"model": args.model, "mode": args.mode, "summary": summary, "tasks": results}, indent=2), encoding="utf-8")
     print(f"\nsaved {fname}")
 
 
