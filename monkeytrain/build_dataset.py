@@ -19,9 +19,12 @@ from collections import Counter, deque
 from pathlib import Path
 
 from .hub import data_repo, get_token, username
-from .sources import commitpack, selfoss, xlam
+from .sources import commitpack, create, selfoss, xlam
 
-DEFAULT_MIX = {"commitpack": 0.75, "selfoss": 0.15, "xlam": 0.10}
+# v4: "create" (build something new from a description) is new; v3 had none and
+# couldn't start an app from scratch.
+DEFAULT_MIX = {"commitpack": 0.60, "create": 0.20, "selfoss": 0.12, "xlam": 0.08}
+CREATE_EVAL = 40
 
 
 def parse_mix(s: str) -> dict[str, float]:
@@ -83,11 +86,48 @@ def take(rows, make, n: int, rng: random.Random, name: str) -> list[dict]:
     return out
 
 
+def build_selfoss(n_create: int, n_qa: int, n_eval: int, rng: random.Random, token: str | None):
+    """Create-mode sessions, plain Q&A and create eval tasks from disjoint Self-OSS rows."""
+    rows = list(selfoss.iter_rows(token))
+    rng.shuffle(rows)
+    third = len(rows) // 3
+    eval_rows, create_rows, qa_rows = rows[:third], rows[third:2 * third], rows[2 * third:]
+
+    # unrelated files to sit in the workspace, so "create" isn't only learned for empty folders
+    pool: list[tuple[str, str]] = []
+    for r in eval_rows[-400:]:
+        code = create.extract_code(r.get("response") or "")
+        if code:
+            pool.append((create.choose_path(code, rng, {p for p, _ in pool}), code))
+    decoys = lambda: rng.sample(pool, k=min(len(pool), rng.randint(1, 4)))
+
+    sessions: list[dict] = []
+    for r in create_rows:
+        if len(sessions) >= n_create:
+            break
+        s = create.make_session(r, rng, decoys())
+        if s:
+            sessions.append(s)
+    print(f"[create] {len(sessions)} sessions")
+
+    tasks: list[dict] = []
+    for r in eval_rows[:-400]:
+        if len(tasks) >= n_eval:
+            break
+        t = create.make_eval_task(r, rng, decoys() if rng.random() < 0.5 else [])
+        if t:
+            tasks.append(t)
+    print(f"[create] {len(tasks)} eval tasks")
+
+    qa = take(qa_rows, selfoss.make_session, n_qa, rng, "selfoss") if n_qa else []
+    return sessions + qa, tasks
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--total", type=int, default=24000, help="training sessions (default 24000)")
+    ap.add_argument("--total", type=int, default=25000, help="training sessions (default 25000)")
     ap.add_argument("--eval", type=int, default=300, help="held-out evaluation tasks")
-    ap.add_argument("--mix", type=parse_mix, default=DEFAULT_MIX, help="e.g. commitpack=0.75,selfoss=0.15,xlam=0.1")
+    ap.add_argument("--mix", type=parse_mix, default=DEFAULT_MIX, help="e.g. commitpack=0.6,create=0.2,selfoss=0.12,xlam=0.08")
     ap.add_argument("--out", default="data")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--no-push", action="store_true", help="don't upload to Hugging Face")
@@ -102,8 +142,12 @@ def main() -> None:
     cp_train, eval_tasks = build_commitpack(n_cp, args.eval, rng, token)
     sessions += cp_train
 
-    if mix.get("selfoss"):
-        sessions += take(selfoss.iter_rows(token), selfoss.make_session, round(args.total * mix["selfoss"]), rng, "selfoss")
+    if mix.get("selfoss") or mix.get("create"):
+        so, create_tasks = build_selfoss(round(args.total * mix.get("create", 0)), round(args.total * mix.get("selfoss", 0)),
+                                         CREATE_EVAL if mix.get("create") else 0, rng, token)
+        sessions += so
+        eval_tasks += create_tasks
+        rng.shuffle(eval_tasks)  # so `evaluate --n 30` gets both kinds
 
     if mix.get("xlam"):
         try:

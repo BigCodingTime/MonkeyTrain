@@ -135,6 +135,15 @@ def _grep_word(request: str, old: str) -> str | None:
     return None
 
 
+def _miss_word(request: str, files: dict[str, str]) -> str | None:
+    """A word from the request that appears in no file: a first search that finds nothing."""
+    words = {w.strip(".") for w in WORD.findall(request)}
+    for w in sorted(words, key=lambda w: (-len(w), w)):
+        if len(w) >= 4 and w.isalpha() and w.lower() not in STOPWORDS and not any(w in c for c in files.values()):
+            return w
+    return None
+
+
 def _call(ws: Workspace, messages: list[dict], name: str, args: dict) -> str:
     messages.append({"role": "assistant", "content": "", "tool_calls": [{"function": {"name": name, "arguments": args}}]})
     result = ws.call(name, args)
@@ -153,8 +162,9 @@ def make_session(rec: dict, rng: random.Random, decoys: list[tuple[str, str]]) -
     messages: list[dict] = [{"role": "system", "content": random_system_prompt(rng, project)}]
     fmt = {"req": req, "req_lc": _lc(req), "path": path, "subj": subj, "subj_lc": _lc(subj)}
 
-    if not rec["old"]:  # new file
-        messages.append({"role": "user", "content": rng.choice(ASK_WITH_PATH).format(**fmt)})
+    if not rec["old"]:  # new file; half the time the user doesn't name it and Monkey uses the repo's name
+        ask = ASK_WITH_PATH if rng.random() < 0.5 else ASK_NO_PATH
+        messages.append({"role": "user", "content": rng.choice(ask).format(**fmt)})
         _call(ws, messages, "write_file", {"path": path, "content": rec["new"]})
         messages.append({"role": "assistant", "content": rng.choice(CREATE_DONE).format(**fmt)})
         return {"source": "commitpack", "messages": messages}
@@ -163,6 +173,10 @@ def make_session(rec: dict, rng: random.Random, decoys: list[tuple[str, str]]) -
     word = _grep_word(req, rec["old"])
     if word and rng.random() < 0.35:
         messages.append({"role": "user", "content": rng.choice(ASK_NO_PATH).format(**fmt)})
+        miss = _miss_word(req, ws.files)
+        if miss and rng.random() < 0.3:  # the first guess finds nothing, so try another word instead of giving up
+            if _call(ws, messages, "grep", {"pattern": miss}) != "No matches.":
+                return None
         result = _call(ws, messages, "grep", {"pattern": word})
         if f"{path}:" not in result:
             return None

@@ -7,6 +7,7 @@ import os
 import urllib.error
 import urllib.request
 
+from .contract import SAMPLING, STOP
 from .render import OLLAMA_TEMPLATE
 
 HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -72,19 +73,11 @@ def generate(model: str, prompt: str, opts: dict) -> dict:
 
 
 def modelfile(gguf_path: str, ctx: int = 8192, threads: int | None = None) -> str:
-    lines = [
-        f"FROM {gguf_path}",
-        f'TEMPLATE """{OLLAMA_TEMPLATE}"""',
-        "PARAMETER stop <|im_end|>",
-        "PARAMETER stop <|endoftext|>",
-        "PARAMETER temperature 0.2",
-        # Ollama otherwise applies repeat_penalty 1.05, which fights edit_file: old_string
-        # must repeat text from the file exactly.
-        "PARAMETER repeat_penalty 1.0",
-        "PARAMETER top_p 0.95",
-        "PARAMETER top_k 40",
-        f"PARAMETER num_ctx {ctx}",
-    ]
+    lines = [f"FROM {gguf_path}", f'TEMPLATE """{OLLAMA_TEMPLATE}"""']
+    lines += [f"PARAMETER stop {s}" for s in STOP]
+    # Sampling shared with MonkeyPaw via the contract; repeat_penalty 1.0 keeps edit_file copies exact.
+    lines += [f"PARAMETER {k} {v}" for k, v in SAMPLING.items()]
+    lines.append(f"PARAMETER num_ctx {ctx}")
     if threads:
         lines.append(f"PARAMETER num_thread {threads}")
     return "\n".join(lines) + "\n"

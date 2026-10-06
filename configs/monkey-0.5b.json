@@ -1,6 +1,6 @@
 {
   "name": "monkey-0.5b",
-  "version": 3,
+  "version": 4,
   "base_model": "unsloth/Qwen2.5-Coder-0.5B-Instruct",
   "max_seq_len": 4096,
   "lora_r": 16,

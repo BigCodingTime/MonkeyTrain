@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import warnings
 from pathlib import Path
 
 from . import ollama
@@ -82,22 +83,42 @@ def run_task(task: dict, model: str, opts: dict, mode: str = "raw") -> dict:
             if result.startswith("Error"):
                 r["tool_errors"] += 1
             messages.append({"role": "tool", "content": result})
+    r["seconds"] = time.time() - t0
+    if task.get("kind") == "create":
+        return {**r, **score_create(task, ws.files)}
     target = task["target_path"]
     final = ws.files.get(target)
     r["changed_target"] = final is not None and final != task["files"][target]
     r["exact_match"] = final == task["expected"]
     r["touched_other_files"] = any(ws.files.get(p) != c for p, c in task["files"].items() if p != target) \
         or len(ws.files) > len(task["files"])
-    r["seconds"] = time.time() - t0
     return r
 
 
-def summarize(results: list[dict]) -> dict:
+def score_create(task: dict, files: dict[str, str]) -> dict:
+    """A build-from-scratch task passes when Monkey wrote a new file that compiles."""
+    new = {p: c for p, c in files.items() if p not in task["files"]}
+    def compiles(code: str) -> bool:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                compile(code, "<eval>", "exec")
+            return True
+        except (SyntaxError, ValueError):
+            return False
+    return {"kind": "create", "created_file": bool(new),
+            "built_from_scratch": any(p.endswith(".py") and compiles(c) for p, c in new.items()),
+            "touched_other_files": any(files.get(p) != c for p, c in task["files"].items())}
+
+
+def summarize(all_results: list[dict]) -> dict:
+    creates = [x for x in all_results if x.get("kind") == "create"]
+    results = [x for x in all_results if x.get("kind") != "create"]
     n = max(len(results), 1)
     pct = lambda k: 100 * sum(bool(x[k]) for x in results) / n
     avg = lambda k: sum(x[k] for x in results) / n
-    tok = sum(x["gen_tokens"] for x in results)
-    sec = sum(x["gen_seconds"] for x in results)
+    tok = sum(x["gen_tokens"] for x in all_results)
+    sec = sum(x["gen_seconds"] for x in all_results)
     return {
         "tasks": len(results),
         "finished_%": pct("finished"),
@@ -111,6 +132,8 @@ def summarize(results: list[dict]) -> dict:
         "unknown_tools_per_task": avg("unknown_tools"),
         "avg_seconds_per_task": avg("seconds"),
         "writing_tok_per_s": tok / sec if sec else 0.0,
+        "create_tasks": len(creates),
+        "built_from_scratch_%": 100 * sum(x["built_from_scratch"] for x in creates) / max(len(creates), 1),
     }
 
 
@@ -140,12 +163,15 @@ def main() -> None:
 
     tasks = load_tasks(args.tasks)[: args.n]
     # num_predict caps a reply, so a model that never stops can't hang the run
-    opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1, num_predict=1024)
+    opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1, num_predict=4096)  # same as MonkeyPaw
     results = []
     for i, task in enumerate(tasks, 1):
         r = run_task(task, args.model, opts, args.mode)
         results.append(r)
-        mark = "exact" if r["exact_match"] else ("changed" if r["changed_target"] else "no change")
+        if r.get("kind") == "create":
+            mark = "built" if r["built_from_scratch"] else ("wrote a file" if r["created_file"] else "nothing created")
+        else:
+            mark = "exact" if r["exact_match"] else ("changed" if r["changed_target"] else "no change")
         print(f"[{i}/{len(tasks)}] {task['target_path']}: {mark}, {r['steps']} steps, "
               f"{r['tool_errors']} tool errors, {r['seconds']:.0f}s", flush=True)
 
