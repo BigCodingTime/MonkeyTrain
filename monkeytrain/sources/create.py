@@ -25,8 +25,9 @@ CODE_BLOCK = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
 TOP_NAME = re.compile(r"^(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 GENERIC_NAMES = ["main.py", "app.py", "script.py", "solution.py"]
 
+# A bare request is the most common way people ask, and it means "write the file".
+BARE_SHARE = 0.35
 ASK = [
-    "{q}",
     "{q}\n\nPut it in a new file.",
     "Make a new Python file for this: {q}",
     "Build this for me: {q}",
@@ -76,6 +77,10 @@ def _explanation(response: str) -> str:
     return ""
 
 
+def _ask(q: str, rng: random.Random) -> str:
+    return q if rng.random() < BARE_SHARE else rng.choice(ASK).format(q=q)
+
+
 def search_word(request: str) -> str | None:
     """What a person would search for: the name they asked for, else the most specific word."""
     named = re.findall(r"`([A-Za-z_][A-Za-z0-9_]{3,})(?:\(.*?\))?`", request)
@@ -102,7 +107,7 @@ def make_session(row: dict, rng: random.Random, decoys: list[tuple[str, str]] | 
     path = choose_path(code, rng, set(files))
     ws = Workspace(files)
     messages: list[dict] = [{"role": "system", "content": random_system_prompt(rng, rng.choice(["project", "app", "scratch", "tools"]))},
-                            {"role": "user", "content": rng.choice(ASK).format(q=q)}]
+                            {"role": "user", "content": _ask(q, rng)}]
 
     # Sometimes look first, find nothing, and build it anyway: the step v3 never learned.
     word = search_word(q)
@@ -130,6 +135,6 @@ def make_eval_task(row: dict, rng: random.Random, decoys: list[tuple[str, str]] 
         return None
     m = TOP_NAME.search(code)
     return {"kind": "create", "system": random_system_prompt(rng, "project"),
-            "request": rng.choice(ASK).format(q=q), "files": dict(decoys or []),
+            "request": _ask(q, rng), "files": dict(decoys or []),
             "target_path": "(new file)", "expected": code, "expected_name": m.group(1) if m else "",
             "path_given": False, "lang": "Python"}

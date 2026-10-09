@@ -137,6 +137,13 @@ def summarize(all_results: list[dict]) -> dict:
     }
 
 
+def select_tasks(tasks: list[dict], kind: str, n: int) -> list[dict]:
+    """The first n tasks of one kind: "edit" (change a file), "create" (build from scratch) or "all"."""
+    if kind != "all":
+        tasks = [t for t in tasks if (t.get("kind") == "create") == (kind == "create")]
+    return tasks[:n]
+
+
 def load_tasks(path: str | None) -> list[dict]:
     if path:
         p = Path(path)
@@ -157,11 +164,13 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=None)
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--out", default="eval_results")
+    ap.add_argument("--kind", choices=["all", "edit", "create"], default="all",
+                    help="edit: change an existing file; create: build something new from scratch")
     ap.add_argument("--mode", choices=["raw", "chat"], default="raw",
                     help="raw: our prompt format (as trained); chat: Ollama's template")
     args = ap.parse_args()
 
-    tasks = load_tasks(args.tasks)[: args.n]
+    tasks = select_tasks(load_tasks(args.tasks), args.kind, args.n)
     # num_predict caps a reply, so a model that never stops can't hang the run
     opts = ollama.options(args.threads, args.ctx, temperature=0, seed=1, num_predict=4096)  # same as MonkeyPaw
     results = []
@@ -179,7 +188,7 @@ def main() -> None:
     print("\n" + "\n".join(f"{k:>24}: {v:.1f}" if isinstance(v, float) else f"{k:>24}: {v}" for k, v in summary.items()))
     out = Path(args.out)
     out.mkdir(exist_ok=True)
-    fname = out / f"{args.model.replace(':', '_').replace('/', '_')}-{args.mode}.json"
+    fname = out / f"{args.model.replace(':', '_').replace('/', '_')}-{args.mode}{'' if args.kind == 'all' else '-' + args.kind}.json"
     fname.write_text(json.dumps({"model": args.model, "mode": args.mode, "summary": summary, "tasks": results}, indent=2), encoding="utf-8")
     print(f"\nsaved {fname}")
 

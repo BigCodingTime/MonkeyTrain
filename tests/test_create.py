@@ -125,3 +125,23 @@ def test_commitpack_new_files_are_sometimes_asked_for_without_a_path():
 def test_searches_for_the_name_the_user_asked_for():
     assert create.search_word("Write a function `get_closest_points(points, k)` that sorts points") == "get_closest_points"
     assert create.search_word("Make a simple calculator with a window") == "calculator"
+
+
+def test_evaluate_can_pick_one_kind_of_task():
+    from monkeytrain.evaluate import select_tasks
+    tasks = [{"target_path": "a.py"}, {"kind": "create"}, {"target_path": "b.py"}, {"kind": "create"}]
+    assert select_tasks(tasks, "create", 30) == [tasks[1], tasks[3]]
+    assert select_tasks(tasks, "edit", 1) == [tasks[0]]
+    assert select_tasks(tasks, "all", 3) == tasks[:3]
+
+
+def test_chat_answers_are_only_for_requests_that_say_so():
+    from monkeytrain.sources import selfoss
+    asks = [selfoss.make_session(ROW, random.Random(seed))["messages"][1]["content"] for seed in range(60)]
+    assert all(a != ROW["instruction"] and ROW["instruction"] in a for a in asks)
+    assert all(any(cue in a.lower() for cue in selfoss.CHAT_CUES) for a in asks)
+
+
+def test_bare_requests_build_a_file_often():
+    bare = sum(s["messages"][1]["content"] == ROW["instruction"] for s in sessions(200))
+    assert 50 <= bare <= 90  # about 35%
